@@ -155,7 +155,7 @@ An architectural blueprint and automated toolset to convert an encrypted physica
    ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 2>/dev/null || true
 
    # Copy key to Kali (replace with your Kali user and Tailscale IP)
-   ssh-copy-id beeth@100.108.124.116
+   ssh-copy-id <KALI_USERNAME>@<KALI_TAILSCALE_IP>
    ```
 
 3. **Configure the Windows App:**
@@ -174,8 +174,8 @@ Save the following script as `Connect-Kali.command` on your macOS Desktop and ru
 
 ```bash
 #!/bin/bash
-KALI_USER="beeth"
-KALI_IP="100.108.124.116"
+KALI_USER="<KALI_USERNAME>"
+KALI_IP="<KALI_TAILSCALE_IP>"
 LOCAL_PORT="33389"
 REMOTE_PORT="3389"
 
@@ -205,7 +205,7 @@ If not using the launcher:
 1. Ensure Tailscale is connected on your Mac.
 2. In Terminal, open the tunnel:
    ```bash
-   ssh -N -L 33389:localhost:3389 beeth@100.108.124.116
+   ssh -N -L 33389:localhost:3389 <KALI_USERNAME>@<KALI_TAILSCALE_IP>
    ```
 3. Open **Windows App** and double-click `127.0.0.1:33389`.
 

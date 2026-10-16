@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-KALI_USER="beeth"
-KALI_IP="100.108.124.116"
+KALI_USER="<KALI_USERNAME>"
+KALI_IP="<KALI_TAILSCALE_IP>"
 
 echo "=== [1/3] Generating SSH Key if not present ==="
 if [ ! -f ~/.ssh/id_ed25519 ]; then

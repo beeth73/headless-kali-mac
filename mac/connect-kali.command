@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Configuration: Change this to your Kali Tailscale IP and User
-KALI_USER="beeth"
-KALI_IP="100.108.124.116"
+KALI_USER="<KALI_USERNAME>"
+KALI_IP="<KALI_TAILSCALE_IP>"
 LOCAL_PORT="33389"
 REMOTE_PORT="3389"
 
