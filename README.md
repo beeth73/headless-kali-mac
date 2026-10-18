@@ -1,223 +1,205 @@
-# Architecture & Engineering Guide: Headless Kali Linux via macOS
+# Headless Kali Linux Workstation via macOS
 
-An architectural blueprint and automated toolset to convert an encrypted physical Kali Linux laptop into a 24/7 headless remote workstation accessible from a Mac anywhere in the world.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Kali%20Linux%20%7C%20macOS-brightgreen.svg)]()
+[![Tailscale](https://img.shields.io/badge/Network-Tailscale%20Mesh-blue.svg)](https://tailscale.com)
+
+A production-grade, zero-trust blueprint to convert an encrypted physical Kali Linux laptop into a 24/7 headless remote workstation accessible from a Mac anywhere in the world—with zero port forwarding and complete disk theft protection.
+
+<p align="center">
+  <img src="docs/images/hero-desktop.png" alt="Kali Linux XFCE Desktop Running on macOS via Windows App" width="850">
+  <br>
+  <em>Kali Linux (XFCE) running in Retina resolution on macOS via an SSH-tunneled WireGuard mesh.</em>
+</p>
+
+---
+
+## ⚡ The 30-Second Summary
+
+* **Zero Exposed Ports:** Tailscale establishes an encrypted peer-to-peer WireGuard mesh between macOS and Kali across residential, cellular, and institutional NATs.
+* **Double-Encrypted Ingress:** RDP traffic binds strictly to `127.0.0.1` on Kali and is accessed via an SSH local port forward, bypassing external packet filtering and perimeter firewalls.
+* **Lid-Closed Headless Mode:** ACPI sleep targets are masked at the `systemd` level, and Wi-Fi power-saving is disabled, allowing the host to run 24/7 with the laptop lid closed.
+* **Data-at-Rest Protection:** Protected by LUKS Full Disk Encryption (FDE). If the laptop is stolen or powered off, data is cryptographically unreadable without the pre-boot passphrase.
+
+> 📖 **Deep Dive Documentation:**
+> * See [ARCHITECTURE.md](ARCHITECTURE.md) for the conceptual model, component breakdown, and system design.
+> * See [INTERNALS.md](INTERNALS.md) for protocol teardowns (XRDP IPC, exit code 134 post-mortem, and WireGuard endpoint roaming).
 
 ---
 
 ## 1. System Architecture
 
-```text
-+----------------------------------------------------------------------------------------------------+
-|                                         PHYSICAL REALITY                                           |
-|   [ Mac (Any Remote Network) ] <===== Public Internet =====> [ Kali Lenovo (Home Router / NAT) ]   |
-+----------------------------------------------------------------------------------------------------+
-                                                  │
-                                                  ▼
-+----------------------------------------------------------------------------------------------------+
-| LAYER 1: NETWORK OVERLAY (Tailscale & WireGuard)                                                   |
-| - Virtual L3 Interface: utun (macOS) <== Encrypted WireGuard UDP ==> tailscale0 (Linux)            |
-| - Mesh Subnet: 100.64.0.0/10 (CGNAT RFC 6598)                                                     |
-| - NAT Traversal via STUN hole-punching and DERP HTTPS (TCP/443) relay fallback                     |
-+----------------------------------------------------------------------------------------------------+
-                                                  │
-                                                  ▼
-+----------------------------------------------------------------------------------------------------+
-| LAYER 2: TRANSPORT MULTIPLEXING (SSH Local Port Forwarding)                                        |
-| - Client: 127.0.0.1:33389 (Mac local loopback socket)                                              |
-| - Protocol: Encapsulated TCP payload piped through SSH-2.0 channel via port 22                     |
-| - Destination: sshd routes to localhost:3389 (lo interface on Kali)                                 |
-+----------------------------------------------------------------------------------------------------+
-                                                  │
-                                                  ▼
-+----------------------------------------------------------------------------------------------------+
-| LAYER 3: APPLICATION & PRESENTATION (XRDP & XFCE)                                                  |
-| - Display Protocol: Remote Desktop Protocol (ITU-T T.125 / MCS / X.224)                            |
-| - Session Daemon: xrdp-sesman forks Xorg with xorgxrdp on virtual Display :10                     |
-| - Window Manager: xfce4-session rasterized via software 2D framebuffer                             |
-+----------------------------------------------------------------------------------------------------+
+```mermaid
+flowchart TD
+    subgraph Client["macOS Client (Any Remote Network)"]
+        A["Windows App (RDP Client)"] -->|"Connects to 127.0.0.1:33389"| B["OpenSSH Client"]
+        B -->|"Encapsulates RDP into SSH Channel"| C["Tailscale (wireguard-go utun)"]
+    end
+
+    subgraph Internet["Public Internet / NAT Traversal"]
+        C -->|"Encrypted UDP Packets (STUN / DERP Relay)"| D["Tailscale (wireguard-go tailscale0)"]
+    end
+
+    subgraph Host["Kali Linux Host (Home Network / Headless)"]
+        D -->|"Port 22 SSH"| E["sshd Daemon"]
+        E -->|"Loopback Forwarding to 127.0.0.1:3389"| F["xrdp Listener Daemon"]
+        F <-->|"TCP 3350 IPC"| G["xrdp-sesman (Session Manager)"]
+        F <-->|"UNIX Socket /tmp/.xrdp/"| H["xorgxrdp (Virtual Display :10)"]
+        H --> I["xfce4-session (Window Manager: xfwm4)"]
+    end
+
+    classDef mac fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC;
+    classDef host fill:#0F172A,stroke:#A855F7,stroke-width:2px,color:#F8FAFC;
+    classDef net fill:#1E1E2E,stroke:#10B981,stroke-width:2px,color:#F8FAFC;
+    class Client mac;
+    class Host host;
+    class Internet net;
 ```
 
 ---
 
-## 2. Engineering Deep-Dive: How Every Layer Operates
+## 2. Repository Structure
 
-### A. Network Layer (NAT Traversal via WireGuard)
-* **The Problem:** The Kali host resides behind residential NAT (or Carrier-Grade NAT) where incoming unsolicited SYN packets are dropped by the router's stateful firewall. Neither machine has a static or public IPv4 address.
-* **The Solution:** Tailscale negotiates a peer-to-peer overlay network using STUN (Session Traversal Utilities for NAT). Both endpoints transmit simultaneous UDP packets to mutually punch holes through stateful NAT translation tables.
-* **Fallback (DERP):** If a strict firewall (such as enterprise or college Wi-Fi) blocks direct UDP, Tailscale automatically falls back to **DERP (Designated Encrypted Relay for Packets)**, routing traffic through encrypted HTTPS relays over standard TCP port 443.
-* **Encryption:** Packets traversing the overlay network use the Noise Protocol Framework:
-  * Key Exchange: **Curve25519**
-  * Symmetric Cipher: **ChaCha20**
-  * Authentication: **Poly1305**
-
-### B. Transport Multiplexing (SSH Local Forwarding)
-* **The Command:** `ssh -N -L 33389:localhost:3389 user@<Kali_Tailscale_IP>`
-* **Why it was required:** Tailscale ACL policies or local host firewalls (`nftables`/`iptables`) frequently drop or reject direct incoming packets to port `3389` on external virtual interfaces (`tailscale0`).
-* **The Mechanism:** 
-  1. The OpenSSH client creates a local listening socket on `127.0.0.1:33389` on macOS.
-  2. RDP traffic from the Windows App client is captured by OpenSSH and multiplexed into an encrypted SSH channel over port 22.
-  3. On Kali, `sshd` unpacks the payload and creates a local loopback TCP connection to `127.0.0.1:3389`.
-  4. To Kali's kernel and XRDP, the traffic originates locally from the loopback interface (`lo`), completely bypassing packet filtering on `tailscale0`.
-
-### C. Display Server (Why GNOME Failed & XFCE Succeeded)
-* **Exit Code 134 (`SIGABRT`):** In Linux, exit code 134 signifies an abort signal (`128 + 6 = SIGABRT`). GNOME 40+ relies on **Mutter**, a 3D-compositing window manager that expects direct hardware acceleration (OpenGL/EGL via DRM/KMS). In a headless, virtual software display (`xorgxrdp`), hardware pipelines are absent, causing Mutter to fail runtime assertions.
-* **D-Bus & systemd Collisions:** Modern GNOME uses `systemd --user` units to manage sessions. When XRDP initializes, inherited environment variables (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`) conflict with existing physical display targets (`:0`).
-* **The XFCE Advantage:** XFCE uses **`xfwm4`**, a classic 2D window manager that writes directly to the X11 server framebuffer using software rasterization. It consumes ~70% less memory and bandwidth, operates without 3D compositing, and is immune to systemd user session collisions.
-
-### D. Kernel ACPI & Power Management
-* **Lid Close Sleep:** Closing a laptop lid triggers an ACPI interrupt to the kernel, forwarded to `systemd-logind`. By default, `systemd-logind` invokes `suspend.target`, dropping the CPU into an ACPI S3 sleep state and cutting power to the PCIe bus and wireless NIC.
-* **The Fix:**
-  1. `HandleLidSwitch=ignore` in `/etc/systemd/logind.conf` tells `systemd-logind` to discard the lid switch event.
-  2. Masking sleep targets (`systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`) links the systemd unit files to `/dev/null`, preventing any service or ACPI signal from entering sleep states.
-  3. Setting `wifi.powersave = 2` inside NetworkManager prevents the Linux kernel from dropping the wireless adapter into a D3 power-save state when display output is disabled.
-
-### E. Data-at-Rest Security (LUKS Pre-Boot Protection)
-* Kali uses **LUKS (Linux Unified Key Setup)** full-disk encryption via `dm-crypt`. 
-* Decryption takes place within the minimal `initramfs` environment before the root filesystem is mounted and before networking daemons (`tailscaled`, `sshd`, `xrdp`) are loaded into RAM.
-* **Security Guarantee:** If the laptop is physically stolen while powered down, the decryption keys are purged from memory, leaving the NVMe storage cryptographically unreadable (AES-XTS-PLAIN64).
+```text
+.
+├── ARCHITECTURE.md          # Mental model & component breakdown
+├── INTERNALS.md             # Low-level protocol deep dives & IPC mechanics
+├── LICENSE                  # MIT License
+├── README.md                # Main documentation & quickstart
+├── docs/
+│   └── images/              # Architecture diagrams & screenshots
+├── kali/
+│   └── setup-kali.sh        # Kali host provisioning & ACPI hardening script
+└── mac/
+    ├── connect-kali.command # 1-click desktop automation launcher
+    └── setup-mac.sh         # macOS client configuration script
+```
 
 ---
 
-## 3. Step-by-Step Replication
+## 3. Quickstart & Replication
 
-### Phase 1: Kali Linux Host Setup
+### Prerequisites
+* **Host:** A laptop running Kali Linux with root/sudo privileges.
+* **Client:** A Mac running macOS 13+ with [Tailscale](https://apps.apple.com/app/tailscale/id1475387142) and [Windows App](https://apps.apple.com/app/windows-app/id1295203466) installed from the Mac App Store.
+* A shared Tailscale account authenticated on both devices.
 
-1. **Install required packages:**
+---
+
+### Step 1: Provision the Kali Linux Host
+
+1. Clone this repository on your Kali machine:
    ```bash
-   sudo apt update && sudo apt install -y xrdp xfce4 xfce4-goodies autocutsel
+   git clone https://github.com/<YOUR_GITHUB_USERNAME>/headless-kali-mac.git
+   cd headless-kali-mac
    ```
 
-2. **Prevent lid close suspend & mask sleep targets:**
+2. Make the host setup script executable and run it:
    ```bash
-   sudo sed -i 's/^#*HandleLidSwitch=.*/HandleLidSwitch=ignore/' /etc/systemd/logind.conf
-   sudo sed -i 's/^#*HandleLidSwitchExternalPower=.*/HandleLidSwitchExternalPower=ignore/' /etc/systemd/logind.conf
-   sudo sed -i 's/^#*HandleLidSwitchDocked=.*/HandleLidSwitchDocked=ignore/' /etc/systemd/logind.conf
-   sudo systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
-   sudo systemctl restart systemd-logind
+   chmod +x kali/setup-kali.sh
+   ./kali/setup-kali.sh
    ```
+   *This automated script:*
+   * Installs `xrdp`, `xfce4`, `xfce4-goodies`, and `autocutsel`.
+   * Sets `HandleLidSwitch=ignore` in `/etc/systemd/logind.conf`.
+   * Masks `sleep.target`, `suspend.target`, `hibernate.target`, and `hybrid-sleep.target`.
+   * Sets `wifi.powersave = 2` in NetworkManager (forces high-performance D0 state).
+   * Disables conflicting `gnome-remote-desktop` user services.
+   * Fixes Polkit color management popups via `/etc/polkit-1/rules.d/02-allow-colord.rules`.
+   * Binds XRDP strictly to `127.0.0.1:3389` (defense-in-depth).
+   * Configures `startwm.sh` and `~/.xsession` for stable XFCE rasterization.
 
-3. **Disable Wi-Fi power-saving:**
+3. Authenticate Tailscale and record your virtual IPv4 address:
    ```bash
-   echo -e "[connection]\nwifi.powersave = 2" | sudo tee /etc/NetworkManager/conf.d/disable-wifi-powersave.conf
-   sudo systemctl restart NetworkManager
-   ```
-
-4. **Disable conflicting GNOME remote services & configure Polkit:**
-   ```bash
-   systemctl --user stop gnome-remote-desktop 2>/dev/null || true
-   systemctl --user disable gnome-remote-desktop 2>/dev/null || true
-
-   sudo adduser xrdp ssl-cert
-   sudo mkdir -p /etc/polkit-1/rules.d
-   sudo bash -c 'cat > /etc/polkit-1/rules.d/02-allow-colord.rules <<EOF
-   polkit.addRule(function(action, subject) {
-       if (action.id.indexOf("org.freedesktop.color-manager.") === 0) {
-           return polkit.Result.YES;
-       }
-   });
-   EOF'
-   sudo systemctl restart polkit
-   ```
-
-5. **Configure session files & environment unsets:**
-   * Edit `/etc/xrdp/startwm.sh` and add these lines right below `#!/bin/sh`:
-     ```bash
-     unset DBUS_SESSION_BUS_ADDRESS
-     unset XDG_RUNTIME_DIR
-     ```
-   * Set user desktop environment:
-     ```bash
-     echo "autocutsel -fork" > ~/.xsession
-     echo "xfce4-session" >> ~/.xsession
-     chmod +x ~/.xsession
-     ```
-
-6. **Start and enable services:**
-   ```bash
-   sudo systemctl enable --now tailscaled
    sudo tailscale up
-   sudo systemctl enable --now xrdp
-   sudo systemctl restart xrdp
+   tailscale ip -4
    ```
-   *Note down the Tailscale IP:* `tailscale ip -4`
 
 ---
 
-### Phase 2: macOS Client Setup
+### Step 2: Configure the macOS Client
 
-1. **Install Applications:**
-   * **Tailscale** (Mac App Store) — Sign in with the same account.
-   * **Windows App** (formerly Microsoft Remote Desktop, Mac App Store).
-
-2. **Configure SSH key-based authentication:**
+1. Clone the repository on your Mac:
    ```bash
-   # Generate key if you don't have one
-   ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 2>/dev/null || true
-
-   # Copy key to Kali (replace with your Kali user and Tailscale IP)
-   ssh-copy-id <KALI_USERNAME>@<KALI_TAILSCALE_IP>
+   git clone https://github.com/<YOUR_GITHUB_USERNAME>/headless-kali-mac.git ~/headless-kali-mac
+   cd ~/headless-kali-mac
    ```
 
-3. **Configure the Windows App:**
+2. Run the client setup script:
+   ```bash
+   chmod +x mac/setup-mac.sh
+   ./mac/setup-mac.sh
+   ```
+   *(You will be prompted for your Kali username, Tailscale IP, and Kali user password once to provision passwordless SSH keys).*
+
+3. Configure the **Windows App** (formerly Microsoft Remote Desktop):
    * Click **+ Add PC**.
    * **PC Name:** `127.0.0.1:33389`
-   * **Credentials:** Add user account with your Kali username and password.
-   * **Settings (`⌘ + ,`) > General:** Check ✅ *"Use Mac shortcuts for copy, cut, paste and select all, undo, and find"*.
+   * **Credentials:** Add user account (`<KALI_USERNAME>` / `<KALI_PASSWORD>`).
+   * **Preferences (`⌘ + ,`) > General:** Check ✅ *"Use Mac shortcuts for copy, cut, paste and select all, undo, and find"*.
    * **Display Tab:** Check ✅ *"Update the session resolution on resize"*.
 
 ---
 
-## 4. Daily Operation & Automation
+### Step 3: HiDPI Scaling (Retina Optimization)
 
-### The 1-Click Desktop Launcher
-Save the following script as `Connect-Kali.command` on your macOS Desktop and run `chmod +x Connect-Kali.command`:
+On a Mac Retina display, native 100% resolution will make Linux UI elements appear small. To apply 2x integer scaling, run this inside a terminal on your Kali desktop:
 
 ```bash
-#!/bin/bash
-KALI_USER="<KALI_USERNAME>"
-KALI_IP="<KALI_TAILSCALE_IP>"
-LOCAL_PORT="33389"
-REMOTE_PORT="3389"
-
-# 1. Generate temp RDP profile
-cat << RDP > /tmp/kali_session.rdp
-full address:s:127.0.0.1:${LOCAL_PORT}
-username:s:${KALI_USER}
-prompt for credentials:i:0
-administrative session:i:0
-RDP
-
-# 2. Start SSH tunnel in background if not already active
-if ! lsof -i :${LOCAL_PORT} > /dev/null 2>&1; then
-    ssh -f -N -L ${LOCAL_PORT}:localhost:${REMOTE_PORT} ${KALI_USER}@${KALI_IP}
-    sleep 1
-fi
-
-# 3. Launch RDP client
-open /tmp/kali_session.rdp
-
-# 4. Close auxiliary terminal window
-osascript -e 'tell application "Terminal" to close front window' > /dev/null 2>&1 &
+xfconf-query -c xsettings -p /Gdk/WindowScalingFactor -s 2
 ```
+*(To revert to 1x scaling, set `-s 1`).*
 
-### Manual Connection Steps
-If not using the launcher:
-1. Ensure Tailscale is connected on your Mac.
-2. In Terminal, open the tunnel:
+---
+
+## 4. Daily Operation
+
+### Method A: The 1-Click Desktop Launcher (Recommended)
+Double-click the **`Connect-Kali.command`** file generated on your Mac Desktop. 
+
+The script will:
+1. Verify if the local SSH tunnel on port `33389` is running (spawning it in the background if absent).
+2. Launch the Windows App directly into the session.
+3. Automatically close its temporary terminal window.
+
+### Method B: Manual CLI Connection
+1. Ensure **Tailscale** is connected in the macOS menu bar.
+2. Open your Mac Terminal and start the forwarded tunnel:
    ```bash
-   ssh -N -L 33389:localhost:3389 <KALI_USERNAME>@<KALI_TAILSCALE_IP>
+   rdp-kali
+   # Equivalent to: ssh -N -L 33389:localhost:3389 <KALI_USERNAME>@<KALI_TAILSCALE_IP>
    ```
-3. Open **Windows App** and double-click `127.0.0.1:33389`.
+3. Open the **Windows App** and double-click `127.0.0.1:33389`.
 
 ---
 
 ## 5. Troubleshooting & Bug Post-Mortems
 
-| Symptom / Error | Root Cause | Engineering Resolution |
+| Symptom | Mechanism / Root Cause | Resolution |
 | :--- | :--- | :--- |
-| **Error `0x204` on client** | RDP client cannot establish a TCP handshake on port 3389/33389. | Verify Tailscale connection and ensure the local SSH tunnel (`ssh -N -L ...`) is running. |
-| **XRDP fails to bind port 3389** | `gnome-remote-desktop` is bound to `0.0.0.0:3389`. | Run `systemctl --user stop gnome-remote-desktop` and restart `xrdp`. |
-| **Exit code 134 (`SIGABRT`)** | Mutter window manager crashes without hardware 3D acceleration or collides with D-Bus environment variables. | Add `unset DBUS_SESSION_BUS_ADDRESS` and `unset XDG_RUNTIME_DIR` to `/etc/xrdp/startwm.sh`, and use XFCE (`xfwm4`). |
-| **Kali goes to sleep on lid close** | ACPI lid event triggers `suspend.target`. | Set `HandleLidSwitch=ignore` in `logind.conf` and run `systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target`. |
-| **Wi-Fi disconnects on lid close** | NetworkManager power-saving triggers PCIe low-power state. | Add `wifi.powersave = 2` to `/etc/NetworkManager/conf.d/disable-wifi-powersave.conf`. |
-| **Tiny UI / Retina scaling issues** | High resolution on Mac screen without DPI scaling. | Run `xfconf-query -c xsettings -p /Gdk/WindowScalingFactor -s 2` inside Kali to enforce 2x integer scaling. |
+| **Error `0x204`** | Client cannot complete a TCP handshake to `127.0.0.1:33389`. | Ensure the SSH tunnel (`rdp-kali`) is actively running in the background and Tailscale is connected. |
+| **Port 3389 bind failure (`errno=98`)** | `gnome-remote-desktop` is running as a user service and holds port 3389. | Run `systemctl --user stop gnome-remote-desktop` and restart `xrdp`. |
+| **Exit code 134 (`SIGABRT`)** | Mutter 3D compositor crashes without GPU acceleration or collides with D-Bus environment variables. | Use XFCE (`xfwm4`) and ensure `unset DBUS_SESSION_BUS_ADDRESS` and `unset XDG_RUNTIME_DIR` are in `/etc/xrdp/startwm.sh`. |
+| **Host sleeps on lid close** | ACPI lid event triggers systemd `suspend.target`. | Set `HandleLidSwitch=ignore` in `logind.conf` and mask all sleep targets with `systemctl mask sleep.target ...`. |
+| **Wi-Fi drops when lid is closed** | NetworkManager power-saving switches the wireless NIC into PCIe D3 low-power state. | Write `wifi.powersave = 2` into `/etc/NetworkManager/conf.d/disable-wifi-powersave.conf`. |
+| **Clipboard out of sync** | X11 primary selection and clipboard buffer separation. | Install `autocutsel` and execute `autocutsel -fork` inside `~/.xsession`. |
+
+---
+
+## 6. Security Considerations & Trade-offs
+
+### Defense-in-Depth Model
+* **Layer 3 (Overlay):** All inter-machine communication is encrypted via WireGuard (ChaCha20-Poly1305).
+* **Layer 4 (Transport):** The RDP stream is enclosed within an SSH-2.0 tunnel authenticated via Ed25519 public keys.
+* **Layer 7 (Application):** XRDP is bound strictly to `127.0.0.1:3389`, preventing direct access from any external or local subnet interface.
+
+### The LUKS Encryption Trade-off
+The host drive uses **LUKS Full Disk Encryption**. 
+* **The Benefit:** If the laptop is physically stolen while powered off, data at rest is cryptographically protected against forensic extraction.
+* **The Limitation:** If the host laptop experiences a hard reboot or power cycle while you are away, execution halts during the `initramfs` pre-boot stage. Because networking daemons (`tailscaled`, `sshd`) load *after* the root partition is decrypted, the machine cannot be reached remotely until the LUKS passphrase is typed on the physical keyboard.
+
+---
+
+## 7. License
+
+This project is licensed under the [MIT License](LICENSE). Contributions, issues, and forks are welcome.
