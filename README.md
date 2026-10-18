@@ -139,6 +139,12 @@ flowchart TD
    * **Preferences (`⌘ + ,`) > General:** Check ✅ *"Use Mac shortcuts for copy, cut, paste and select all, undo, and find"*.
    * **Display Tab:** Check ✅ *"Update the session resolution on resize"*.
 
+<p align="center">
+  <img src="docs/images/windows-app-config.png" alt="Windows App PC Configuration" width="650">
+  <br>
+  <em>Windows App configuration: Loopback address 127.0.0.1:33389 and session settings.</em>
+</p>
+
 ---
 
 ### Step 3: HiDPI Scaling (Retina Optimization)

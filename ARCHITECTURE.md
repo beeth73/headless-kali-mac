@@ -52,6 +52,12 @@ flowchart TD
 
 ### Layer 1: Network Overlay & NAT Traversal (Tailscale & WireGuard)
 
+<p align="center">
+  <img src="docs/images/tailscale-status.png" alt="Tailscale Peer-to-Peer Connection Status" width="700">
+  <br>
+  <em>Direct P2P WireGuard link established across independent networks with sub-10ms latency.</em>
+</p>
+
 Traditional VPN architectures depend on a centralized, static public IP (Hub-and-Spoke model). This architecture implements a **decentralized, point-to-point mesh** using Tailscale:
 
 ```text

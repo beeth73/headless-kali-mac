@@ -23,7 +23,8 @@ sequenceDiagram
     Sesman->>Xorg: Forks Xorg with xorgxrdp driver
     Xorg->>WM: Spawns desktop environment (~/.xsession)
     Sesman-->>XRDP: Returns Display :10 parameters
-    XRDP<->>Xorg: Connects via UNIX Socket (/tmp/.xrdp/xrdp_display_10)
+    XRDP->>Xorg: Attaches via UNIX Socket (/tmp/.xrdp/xrdp_display_10)
+    Xorg-->>XRDP: Framebuffer dirty rectangles & events
     XRDP-->>Client: Streams differential RDP bitmap updates
 ```
 
