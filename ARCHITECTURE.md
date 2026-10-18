@@ -1,144 +1,228 @@
-# Core Architectural Concepts: Mesh VPN, WireGuard, XRDP & Client Rendering
+# System Architecture & Design Specification
 
-This document explains the conceptual mental model behind the remote workstation architecture, contrasting traditional VPNs with mesh networks, and detailing the specific roles played by **WireGuard**, **XRDP**, and the **macOS Windows App**.
+This document provides a comprehensive technical breakdown of the headless remote workstation pipeline. It details the design rationale, component interaction models, protocol encapsulations, and hardware/kernel abstractions.
 
 ---
 
-## 1. Mental Model: Traditional VPN vs. Mesh VPN (Tailscale)
+## 1. High-Level Topology & Data Flow
 
-### Traditional VPN: The "Fixed Anchor" (Hub-and-Spoke)
+The system transforms a standard physical laptop into a headless compute and offensive-security node accessible over untrusted public networks without exposing services to the public internet.
 
-```text
-[ Roaming Client (Mac) ] ───> [ Central VPN Server (Static Public IP) ]
- (Dynamic Public IP)                         │
-                                             ▼
-                                 [ Destination Network ]
+```mermaid
+flowchart TD
+    subgraph Client["macOS Client Environment"]
+        App["Windows App (RDP Client)"]
+        SSHClient["OpenSSH Client (L-Forwarder)"]
+        TunMac["Tailscale Engine (wireguard-go / utun)"]
+        
+        App -->|"TCP 127.0.0.1:33389"| SSHClient
+        SSHClient -->|"SSH-2.0 Channel (Port 22)"| TunMac
+    end
+
+    subgraph Overlay["Overlay Transport (WireGuard Mesh)"]
+        TunMac -->|"Encrypted UDP Packets (Noise Protocol)"| TunLinux
+    end
+
+    subgraph Host["Kali Linux Host Environment"]
+        TunLinux["Tailscale Engine (wireguard-go / tailscale0)"]
+        SSHD["sshd Daemon"]
+        XRDP["xrdp Listener (127.0.0.1:3389)"]
+        Sesman["xrdp-sesman (Session Manager)"]
+        Xorg["xorgxrdp Virtual Display (:10)"]
+        XFCE["xfce4-session (xfwm4)"]
+
+        TunLinux -->|"Ingress SSH (Port 22)"| SSHD
+        SSHD -->|"Loopback Forward (127.0.0.1:3389)"| XRDP
+        XRDP <-->|"IPC Socket (TCP 127.0.0.1:3350)"| Sesman
+        XRDP <-->|"UNIX Domain Socket (/tmp/.xrdp/)"| Xorg
+        Xorg -->|"X11 Protocol"| XFCE
+    end
+
+    classDef mac fill:#1E293B,stroke:#38BDF8,stroke-width:2px,color:#F8FAFC;
+    classDef host fill:#0F172A,stroke:#A855F7,stroke-width:2px,color:#F8FAFC;
+    classDef net fill:#1E1E2E,stroke:#10B981,stroke-width:2px,color:#F8FAFC;
+    class Client mac;
+    class Host host;
+    class Overlay net;
 ```
 
-* **Architecture:** A dynamic client connects to a dedicated, centralized server that has a fixed, static public IP address.
-* **Limitation:** To self-host this model, your home router would need a static public IP assigned by your ISP or Dynamic DNS with open port-forwarding, creating a single point of failure and exposure to public internet port scanners.
-
 ---
 
-### Mesh VPN (Tailscale): The Dynamic Peer-to-Peer Model
+## 2. Layer-by-Layer Architectural Decomposition
+
+### Layer 1: Network Overlay & NAT Traversal (Tailscale & WireGuard)
+
+Traditional VPN architectures depend on a centralized, static public IP (Hub-and-Spoke model). This architecture implements a **decentralized, point-to-point mesh** using Tailscale:
 
 ```text
-                     [ Tailscale Coordination Server ]
-                      (Exchanges Keys & NAT Endpoints)
-                               /            \
-                              /              \
-                             ▼                ▼
-                 [ Mac (Dynamic IP A) ] <══> [ Kali (Dynamic IP B) ]
-                          (Direct Peer-to-Peer WireGuard Tunnel)
+[ Client (Mac) ] <════ Direct P2P WireGuard Tunnel ════> [ Host (Kali) ]
+       │                                                         │
+       └───> [ Tailscale Coordination Server (Control Plane) ] <───┘
+             (Discovers Public Endpoints via STUN; Exchanging Keys)
 ```
 
-* **No Fixed Public IPs:** Both Kali and Mac can reside behind arbitrary NATs, use dynamic IP addresses, and switch internet providers without breaking connectivity.
-* **The Coordination Plane:** A lightweight coordination server brokers public keys and NAT endpoint discovery via STUN. Once discovered, traffic travels directly peer-to-peer between the two devices.
-* **The "Shock Absorber" Effect:** Standard SSH binds to a physical network interface; if your Wi-Fi changes, your physical IP changes, the TCP 4-tuple breaks, and the connection drops (`Broken pipe`). Tailscale abstracts this by binding the SSH socket to an **immutable overlay IP (`100.x.x.x`)**. The underlying physical gateway can disconnect and reconnect, but the overlay socket never notices the change.
+1. **Control Plane vs. Data Plane:**
+   * **Control Plane (Coordination Server):** Devices register their cryptographic public keys and exchange reflexive transport addresses gathered via **STUN (Session Traversal Utilities for NAT)**. No user payload traffic touches the control plane.
+   * **Data Plane (Direct WireGuard Tunnel):** Once endpoint pairs are brokered, clients initiate direct bidirectional UDP hole punching. Traffic travels point-to-point without intermediaries.
+2. **Userspace Implementation (`wireguard-go`):**
+   * Tailscale implements WireGuard in userspace via `wireguard-go`, interacting with the operating system through virtual Layer 3 TUN interfaces (`utun` on macOS, `tailscale0` on Linux).
+   * While kernel-space WireGuard avoids user-to-kernel context switching, `wireguard-go` provides cross-platform protocol consistency, integrated path discovery, and automatic fallback mechanisms.
+3. **DERP (Designated Encrypted Relay for Packets):**
+   * If symmetric enterprise NATs or institutional firewalls drop UDP packets entirely, Tailscale falls back to DERP relays.
+   * Traffic is packaged into standard HTTPS/TLS frames over TCP port 443. Relays forward packets based strictly on destination public keys; payload contents remain cryptographically opaque to the relay.
+4. **Endpoint Roaming:**
+   * WireGuard associates peers with cryptographic public keys rather than network-level IP addresses.
+   * When the macOS client switches physical networks (e.g., home Wi-Fi to a cellular hotspot), the source IP and port change. The client transmits an authenticated packet from the new endpoint.
+   * The host verifies the cryptographic signature (Poly1305 MAC), dynamically updates its routing table with the client's new physical socket, and resumes transmission without renegotiating session state.
 
 ---
 
-## 2. Why WireGuard? (The Transport Engine)
+### Layer 2: Transport Security & Loopback Proxying (OpenSSH)
 
-Tailscale uses WireGuard as its underlying tunneling protocol rather than legacy technologies like OpenVPN or IPsec.
+The pipeline employs an SSH local port forward as an intermediate proxy between the RDP client and the XRDP daemon:
+
+$$\text{Mac}:\text{127.0.0.1:33389} \xrightarrow{\text{SSH-2.0 Channel}} \text{Kali}:\text{sshd} \xrightarrow{\text{Loopback}} \text{Kali}:\text{127.0.0.1:3389}$$
 
 ```text
 +────────────────────────────────────────────────────────────────────────────+
-|                               USER SPACE                                   |
-|   OpenVPN / Classic VPNs: Packets bounce across User/Kernel boundary       |
-|   (Context Switching overhead, higher latency, higher battery drain)       |
-+────────────────────────────────────────────────────────────────────────────+
-                                ▲            │
-                    Context Sw. │            │ Context Sw.
-                                │            ▼
-+────────────────────────────────────────────────────────────────────────────+
-|                               KERNEL SPACE                                 |
-|   WireGuard: Runs natively inside the Linux Kernel (/net/wireguard)        |
-|   (Zero-copy packet processing, line-rate encryption, minimal CPU usage)   |
+|                           THE LOCAL PORT FORWARD                           |
+|                                                                            |
+|   Windows App ──> [127.0.0.1:33389]                                        |
+|                          │                                                 |
+|                   (OpenSSH Client)                                         |
+|                          │                                                 |
+|             === SSH-2.0 Encrypted Channel ===                              |
+|                          │                                                 |
+|                   (Kali sshd Daemon)                                       |
+|                          │                                                 |
+|                          └──> connect(127.0.0.1, 3389) ──> [xrdp]         |
 +────────────────────────────────────────────────────────────────────────────+
 ```
 
-### Key Technical Advantages:
-1. **Kernel-Space Execution (Zero Context-Switching):**
-   * Legacy VPNs run as user-space daemons, requiring expensive context switches between user and kernel space for every packet.
-   * WireGuard executes directly inside kernel space, processing encrypted packets at line-rate speed with minimal latency and lower battery consumption on laptops.
-2. **Minimal Attack Surface:**
-   * OpenVPN contains **~100,000+ lines of code**.
-   * IPsec contains **~400,000+ lines of code**.
-   * WireGuard contains only **~4,000 lines of code**, making it mathematically auditable and drastically reducing security vulnerabilities.
-3. **Stateless UDP & Cryptokey Routing:**
-   * Traditional VPNs rely on complex state machines. If a connection drops, the handshake negotiation must restart from scratch.
-   * WireGuard is stateless: it sends encrypted UDP packets authenticated with **Poly1305** message authentication codes. If a client's physical IP changes, the server validates the cryptographic signature, updates the peer's endpoint mapping, and continues routing without resetting the connection.
+#### Why Loopback Forwarding is Essential:
+1. **Perimeter Firewall & ACL Bypass:** In default Tailscale setups, network ACLs or local firewall configurations (`iptables`/`nftables`) often drop inbound connections on non-standard ports (such as 3389) arriving on `tailscale0`. Because SSH (Port 22) is standard, it passes through unhindered.
+2. **Defense-in-Depth Interface Binding:** By configuring XRDP to bind strictly to `tcp://127.0.0.1:3389`, the RDP port is entirely inaccessible from local LANs, public Wi-Fi, or the Tailscale interface directly. The *only* path to the display server is through an authenticated SSH session holding an authorized Ed25519 key.
+3. **Double Cryptographic Wrapping:** The RDP data stream is encrypted by TLS, encapsulated inside an SSH-2.0 stream (ChaCha20-Poly1305 or AES-GCM), which is further encapsulated inside WireGuard UDP packets.
 
 ---
 
-## 3. What is XRDP's Role? (The Server-Side Translator)
+### Layer 3: Presentation & Display Virtualization (XRDP & XFCE)
 
-Kali Linux natively generates graphics using the **X11 Display Protocol**, whereas the Microsoft client expects **Remote Desktop Protocol (RDP)** wire packets.
+The display subsystem decouples the graphical user interface from physical monitor hardware:
 
-XRDP serves as the bridge, virtual GPU, and session supervisor:
+```text
+[ macOS Windows App ]
+         │ (RDP Protocol over Local Forward)
+         ▼
++────────────────────────────────────────────────────────────────────────────+
+| xrdp Listener Daemon (127.0.0.1:3389)                                      |
+| - Manages RDP connection state machine (ITU-T T.125 / X.224)              |
+| - Decodes client input events (mouse, keyboard, clipboard)                |
++────────────────────────────────────────────────────────────────────────────+
+         │
+         ├─── (TCP 127.0.0.1:3350) ───> [ xrdp-sesman ]
+         │                               (PAM Auth & Session Lifecycle)
+         │
+         └─── (UNIX Socket: /tmp/.xrdp/xrdp_display_10)
+                 │
+                 ▼
++────────────────────────────────────────────────────────────────────────────+
+| xorgxrdp (Headless X11 Display Driver on Display :10)                      |
+| - Allocates framebuffers in RAM                                            |
+| - Calculates dirty screen rectangles for differential RDP encoding         |
++────────────────────────────────────────────────────────────────────────────+
+                 │ (X11 Core Protocol)
+                 ▼
++────────────────────────────────────────────────────────────────────────────+
+| Window Manager & Desktop (xfwm4 / xfce4-session)                           |
+| - 2D software rasterization (no GPU/OpenGL dependencies)                   |
+| - Independent from systemd user-session targets                            |
++────────────────────────────────────────────────────────────────────────────+
+```
+
+#### The Engineering Decision: XFCE over GNOME
+During initial deployment, modern GNOME 40+ failed with **exit code 134 (`SIGABRT`)**. The architecture shifted to XFCE based on the following technical constraints:
+
+* **Compositor Graphics Pipeline:** Modern GNOME depends on **Mutter**, a 3D-compositing window manager that assumes direct hardware acceleration (OpenGL/EGL via DRM/KMS). In a virtual display server (`xorgxrdp`), no direct GPU pipeline exists. Mutter encounters failed assertion checks when initializing software GL fallbacks under certain drivers, causing `SIGABRT`.
+* **Resource Footprint:** XFCE relies on **`xfwm4`**, a non-compositing (or lightweight compositing) 2D window manager that writes directly to the X11 server framebuffer using software rasterization. This eliminates GPU driver panics, reduces memory overhead, and reduces network bandwidth requirements when streaming screen updates over RDP.
+* **D-Bus Environment Hygiene:** `xrdp-sesman` launches sessions under an environment where leftover D-Bus variables (`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`) can cause systemd user-session collisions. Unsetting these variables in `/etc/xrdp/startwm.sh` ensures XFCE initializes an isolated, clean execution context.
+
+---
+
+### Layer 4: Kernel ACPI & Power Management Subsystem
+
+Standard consumer laptops are engineered to enter power-saving sleep states when the lid is closed. In a headless server configuration, this behavior must be suppressed at the kernel and daemon level:
+
+```text
+[ Physical Lid Close Event ]
+              │
+              ▼
+    (Kernel ACPI Driver)
+              │
+              ▼
+   (/dev/input/event* Interrupt)
+              │
+              ▼
+     [ systemd-logind ] ───(Reads logind.conf: HandleLidSwitch=ignore)───> [ Event Discarded ]
+              │
+      (If Target Triggered)
+              │
+              ▼
+     [ suspend.target ] ───(Masked: Symlinked to /dev/null)───> [ Kernel Sleep Blocked ]
+```
+
+1. **ACPI Event Interception:**
+   * Closing the laptop lid triggers an ACPI interrupt from the embedded controller (EC).
+   * The kernel exposes this through the input subsystem (`/dev/input/eventX`).
+   * `systemd-logind` captures the event. Configuring `HandleLidSwitch=ignore` and `HandleLidSwitchExternalPower=ignore` instructs the daemon to take no action upon receiving the signal.
+2. **Systemd Target Masking (The Failsafe):**
+   * Even with `logind.conf` configured, secondary power management frameworks (such as UPower or desktop daemons) can issue direct requests to sleep targets.
+   * Executing `systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target` creates symbolic links from these unit files directly to `/dev/null`. If any process issues an invocation to enter an ACPI S3/S0ix state, systemd treats the target as non-existent and refuses the transition.
+3. **PCIe Active State Power Management (ASPM) & Wi-Fi:**
+   * Wireless network interface controllers (NICs) often drop into low-power states (D3hot/D3cold) when display output ceases.
+   * Setting `wifi.powersave = 2` inside NetworkManager disables dynamic 802.11 power saving, forcing the wireless chip to maintain full-power **D0 operational state**, preventing silent network drops while the host sits unattended.
+
+---
+
+### Layer 5: Data-at-Rest Security & The LUKS Boundary
+
+The host utilizes **LUKS (Linux Unified Key Setup)** operating via the Linux kernel's **`dm-crypt`** subsystem:
 
 ```text
 +────────────────────────────────────────────────────────────────────────────+
-| 1. Protocol Translation                                                    |
-|    Translates X11 graphical draw operations into compressed RDP rectangles |
-|    and injects remote mouse/keyboard packets back into the X11 queue.     |
+| UNENCRYPTED PRE-BOOT STAGE                                                 |
+| - BIOS / UEFI initializes motherboard hardware                             |
+| - GRUB bootloader executes from unencrypted /boot/efi partition            |
+| - Minimal Linux kernel & initramfs load into RAM                           |
 +────────────────────────────────────────────────────────────────────────────+
+                                      │
+                         [ LUKS PASSPHRASE PROMPT ]
+                        (Halts execution; NO NETWORKING)
                                       │
                                       ▼
 +────────────────────────────────────────────────────────────────────────────+
-| 2. Virtual Display Engine (xorgxrdp)                                       |
-|    Allocates an isolated, headless display in system RAM (Display :10).    |
-|    Renders the desktop even when the laptop lid is closed and the physical |
-|    GPU/screen is powered down.                                             |
-+────────────────────────────────────────────────────────────────────────────+
-                                      │
-                                      ▼
-+────────────────────────────────────────────────────────────────────────────+
-| 3. Session Persistence (xrdp-sesman)                                       |
-|    Supervises the XFCE session via PAM authentication. Keeps the desktop   |
-|    and all background processes running in memory when the client drops.   |
+| ENCRYPTED RUNTIME STAGE (dm-crypt AES-XTS-PLAIN64)                         |
+| - /dev/mapper/kali-root mounted as root filesystem                         |
+| - systemd PID 1 initializes system services                                |
+| - Daemons load into memory: NetworkManager, tailscaled, sshd, xrdp         |
 +────────────────────────────────────────────────────────────────────────────+
 ```
 
----
-
-## 4. What is the Windows App Doing? (The Client-Side Engine)
-
-The **Windows App** (formerly *Microsoft Remote Desktop*) running on macOS is not just a viewer; it handles client-side rendering and hardware virtualization:
-
-```text
-[ Inbound Encrypted RDP Stream (via 127.0.0.1:33389) ]
-                         │
-                         ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                             THE WINDOWS APP                                │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 1. Metal Framebuffer Decoding:                                             │
-│    Decompresses RDP bitmap tiles and renders them directly using Apple's   │
-│    low-overhead Metal graphics API.                                        │
-│                                                                            │
-│ 2. Scancode & Input Mapping:                                               │
-│    Translates macOS key events (e.g., Command ⌘, Option ⌥) into standard   │
-│    PC scan codes expected by the Linux kernel.                             │
-│                                                                            │
-│ 3. Clipboard Redirection:                                                  │
-│    Hooks into macOS NSPasteboard to bi-directionally sync system clipboard  │
-│    data across the RDP virtual channel.                                    │
-│                                                                            │
-│ 4. HiDPI & Dynamic Resizing:                                               │
-│    Negotiates screen resolution and DPI boundaries to ensure fonts render  │
-│    crisply on Retina displays without blurriness.                          │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+#### The Security Threat Model & Architectural Trade-off:
+* **The Benefit (Physical Theft Mitigation):** In the event of physical theft while the laptop is powered down or the lid is closed, the decryption keys are absent from volatile memory (RAM). The NVMe storage device is cryptographically protected against forensic extraction.
+* **The Architectural Limitation:** Remote management is impossible across an unattended reboot. Because Tailscale, SSH, and networking drivers exist entirely within the encrypted root filesystem, they cannot initialize until the LUKS passphrase is submitted via the physical keyboard during the `initramfs` phase.
 
 ---
 
-## 5. Architectural Summary Table
+## 3. Comprehensive Component Responsibility Matrix
 
-| Component | Host Platform | Layer | Primary Responsibility |
+| Component | Host System | Operational Layer | Technical Function |
 | :--- | :--- | :--- | :--- |
-| **WireGuard (Tailscale)** | Kernel (Both) | L3 Network Overlay | P2P NAT traversal, packet encryption, and IP roaming across network transitions. |
-| **OpenSSH Tunnel** | Userspace (Both) | L4 Transport Proxy | Multiplexes RDP traffic over port 22, circumventing external port 3389 filtering. |
-| **XRDP / `xorgxrdp`** | Linux (Kali) | L7 Presentation / Display | Renders a headless X11 desktop in RAM and encodes display deltas into RDP format. |
-| **Windows App** | macOS (Mac) | L7 Application / Client | Decodes RDP streams via Metal and bridges keyboard, mouse, and clipboard hardware. |
+| **Tailscale Engine** | macOS / Kali | L3 Network Overlay | Manages `wireguard-go` TUN drivers, STUN endpoint discovery, and DERP relay fallbacks. |
+| **OpenSSH Client/Server**| macOS / Kali | L4 Transport Proxy | Establishes authenticated port-forwarding channels; binds local/remote loopback sockets. |
+| **xrdp** | Kali Linux | L7 Presentation | Implements RDP wire protocol, TLS termination, and input stream decoding on `127.0.0.1:3389`. |
+| **xrdp-sesman** | Kali Linux | System Service | Authenticates users via PAM and coordinates session lifecycles across TCP port `3350`. |
+| **xorgxrdp** | Kali Linux | Display Driver | Acts as a virtual video adapter inside Xorg, maintaining RAM framebuffers for Display `:10`. |
+| **xfwm4 / XFCE** | Kali Linux | User Workspace | Executes desktop window management via 2D software rendering, bypassing GPU requirements. |
+| **systemd-logind** | Kali Linux | Kernel ACPI Interface | Monitors `/dev/input` for lid switch events and suppresses ACPI S3 sleep transitions. |
+| **Windows App** | macOS | L7 Client Application | Decodes RDP bitmap frames via Metal and maps keyboard scancodes and clipboard buffers. |
