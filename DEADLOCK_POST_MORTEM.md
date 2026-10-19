@@ -1,5 +1,3 @@
----
-
 # Case Study & Post-Mortem: Multi-Seat Race Conditions, ACPI Masking, and Polkit Isolation
 
 **Author:** Bhushan Ladgaonkar  
