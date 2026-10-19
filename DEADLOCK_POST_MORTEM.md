@@ -85,7 +85,9 @@ Why did the physical display lock screen accept the password and freeze with the
    * **Keyring:** `gnome-keyring-daemon` domain socket.
 3. **The Race Condition:**
    The active background XRDP session already held exclusive possession of the user’s D-Bus session bus and active keyring sockets on virtual `Display :10`. When GDM’s worker spawned on physical `seat0`, it executed a blocking synchronous IPC call:
-   $$\text{dbus\_request\_name}(\dots, \text{DBUS\_NAME\_FLAG\_DO\_NOT\_QUEUE})$$
+```c
+dbus_request_name(..., DBUS_NAME_FLAG_DO_NOT_QUEUE)
+```
    Because single-user desktop managers are historically architected under the assumption of a **single physical seat per user**, GDM and XRDP deadlocked waiting for shared lock releases that neither process would yield.
 
 ---
